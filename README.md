@@ -119,7 +119,7 @@ claude --version
 Clone or copy this repository, then install globally with npm:
 
 ```bash
-git clone <your-repo-url> anon-proxy
+git clone https://github.com/justinb4003/claude-anon-proxy.git anon-proxy
 cd anon-proxy
 npm install -g .
 ```
@@ -349,7 +349,7 @@ The tool itself (this repo) is safe to share via git. The mapping files that con
 
 ```bash
 # 1. Clone the tool
-git clone <your-repo-url> anon-proxy
+git clone https://github.com/justinb4003/claude-anon-proxy.git anon-proxy
 cd anon-proxy
 npm install -g .
 
