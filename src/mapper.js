@@ -8,6 +8,30 @@ const GLOBAL_MAPPINGS_PATH = path.join(os.homedir(), '.config', 'anon-proxy', 'm
 const LEARNED_FILE = '.anon-learned.json';
 const LOCAL_MAPPINGS_FILE = '.anon-mappings.json';
 
+// Built-in passthrough allowlist. These public model / service names are
+// mapped to themselves so they pass through unchanged — and so the detector's
+// `manualReals` check skips them during aggressive learning. Keeps assistant
+// context readable instead of turning "gpt-4.1-mini" into "res-017".
+const BUILTIN_PASSTHROUGH = [
+  // OpenAI / Azure OpenAI chat model families
+  'gpt-3.5-turbo',
+  'gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini',
+  'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano',
+  'gpt-5', 'gpt-5-mini', 'gpt-5.1', 'gpt-5.2',
+  'o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini', 'o4-mini',
+  // Embeddings
+  'text-embedding-ada-002',
+  'text-embedding-3-small', 'text-embedding-3-large',
+  // Image / audio
+  'dall-e-2', 'dall-e-3', 'whisper-1', 'tts-1', 'tts-1-hd',
+  // Mistral on Azure
+  'mistral-large', 'mistral-large-2407', 'mistral-small',
+  'mistral-document-ai', 'mistral-document-ai-2512',
+  // Anthropic Claude (in case Claude Code traffic references model IDs)
+  'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5',
+  'claude-opus-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5-20251001',
+];
+
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -34,6 +58,13 @@ class Mapper {
   reload() {
     this.mappings.clear();
     this.reverse.clear();
+
+    // Seed with built-in passthroughs first; file-based mappings below may
+    // override any of these if the user wants different behavior.
+    for (const name of BUILTIN_PASSTHROUGH) {
+      this.mappings.set(name, name);
+      this.reverse.set(name, name);
+    }
 
     for (const file of this._files) {
       this._loadFile(file);

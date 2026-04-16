@@ -116,6 +116,21 @@ function _skipValue(val) {
   return false;
 }
 
+// Heuristic: does this string look like a resource identifier rather than a
+// plain word or sentence? Used in aggressive (az-sourced) learning to avoid
+// aliasing common words like "Enabled" or "North".
+function _looksLikeIdentifier(s) {
+  if (s.length < 3 || s.length > 120) return false;
+  if (/\s/.test(s)) return false;                         // no spaces
+  if (!/^[A-Za-z0-9]/.test(s)) return false;
+  if (!/[A-Za-z]/.test(s)) return false;                  // must contain a letter
+  if (/[-_]/.test(s)) return true;                        // kebab / snake
+  if (/[a-z][A-Z]/.test(s)) return true;                  // camelCase
+  if (/\d/.test(s) && /[A-Za-z]/.test(s)) return true;    // mixed alpha+digit
+  if (/\./.test(s) && !/^\d/.test(s)) return true;        // dotted (fqdn-ish)
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------------
@@ -208,23 +223,38 @@ class Detector {
     let parsed;
     try { parsed = JSON.parse(body); } catch { return; }
 
-    const deepScan = (text) => {
+    // Correlate tool_use → tool_result: collect tool_use ids whose command
+    // warrants aggressive learning (az CLI, db CLIs, Python scripts).
+    const aggressiveToolUseIds = new Set();
+    for (const msg of parsed.messages || []) {
+      if (!Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        if (block?.type === 'tool_use' && this._wantsAggressive(block) && block.id) {
+          aggressiveToolUseIds.add(block.id);
+        }
+      }
+    }
+
+    const deepScan = (text, aggressive = false) => {
       // Try to parse as JSON (Azure CLI output is typically JSON)
       try {
         const obj = JSON.parse(text);
-        this._walkAzureObject(obj, learn, 0);
-      } catch { /* not JSON — that's fine */ }
+        this._walkAzureObject(obj, learn, 0, aggressive);
+      } catch {
+        // Not JSON — if we know it came from `az`, try table-format parsing
+        if (aggressive) this._scanAzTable(text, learn);
+      }
       // Also run regex patterns on the decoded string (catches things
       // that were double-escaped in the outer JSON)
       this._scanPatterns(text, learn, learnFqdn);
     };
 
-    const scanContent = (content) => {
-      if (typeof content === 'string') { deepScan(content); return; }
+    const scanResultContent = (content, aggressive) => {
+      if (typeof content === 'string') { deepScan(content, aggressive); return; }
       if (!Array.isArray(content)) return;
       for (const block of content) {
-        if (block.text) deepScan(block.text);
-        if (block.type === 'tool_result') scanContent(block.content);
+        if (block.text) deepScan(block.text, aggressive);
+        if (block.type === 'tool_result') scanResultContent(block.content, aggressive);
       }
     };
 
@@ -234,16 +264,50 @@ class Detector {
       for (const b of parsed.system) { if (b.text) deepScan(b.text); }
     }
 
-    // Messages
-    for (const msg of parsed.messages || []) scanContent(msg.content);
+    // Messages — route tool_result scanning with the az-source flag.
+    for (const msg of parsed.messages || []) {
+      if (typeof msg.content === 'string') { deepScan(msg.content); continue; }
+      if (!Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) deepScan(block.text);
+        if (block.type === 'tool_use' && block.input && typeof block.input === 'object') {
+          try { deepScan(JSON.stringify(block.input)); } catch { /* ignore */ }
+        }
+        if (block.type === 'tool_result') {
+          const aggressive = aggressiveToolUseIds.has(block.tool_use_id);
+          scanResultContent(block.content, aggressive);
+        }
+      }
+    }
+  }
+
+  // Does this tool_use block's command warrant aggressive learning?
+  // Matches the `az` CLI, common database clients, and Python-family
+  // interpreters. Python triggers aggressive mode unconditionally since we
+  // can't see inside the script — accepted as a tradeoff for coverage.
+  // (String literals use \x73 escapes for the letter before "ql" to avoid
+  // interaction with outbound substring replacement of "\x73ql" tokens.)
+  _wantsAggressive(block) {
+    if (block.name !== 'Bash') return false;
+    const cmd = block.input?.command;
+    if (typeof cmd !== 'string') return false;
+    const boundary = '(^|[\\s;&|`(])';
+    const tools = [
+      'az',
+      '\x73qlcmd', 'p\x73ql', 'my\x73ql', '\x73qlite3',
+      'mongosh', 'redis-cli', 'm\x73\x73ql-cli', 'pgcli', 'mycli', 'iredis',
+      'python', 'python3', 'ipython', 'jupyter',
+    ].join('|');
+    return new RegExp(`${boundary}(${tools})\\s`).test(cmd);
   }
 
   // Walk a parsed Azure JSON object (e.g. CLI output) and extract values
-  // from known sensitive fields.
-  _walkAzureObject(obj, learn, depth) {
+  // from known sensitive fields. In aggressive mode (az-sourced), learn
+  // every string value that looks like an identifier.
+  _walkAzureObject(obj, learn, depth, aggressive = false) {
     if (depth > 10) return;
     if (Array.isArray(obj)) {
-      for (const item of obj) this._walkAzureObject(item, learn, depth + 1);
+      for (const item of obj) this._walkAzureObject(item, learn, depth + 1, aggressive);
       return;
     }
     if (typeof obj !== 'object' || obj === null) return;
@@ -260,10 +324,56 @@ class Detector {
 
         if (isSensitive || isResourceName) {
           learn(value, _categorizeField(key));
+        } else if (aggressive && _looksLikeIdentifier(value)) {
+          learn(value, _categorizeField(key));
         }
       }
       if (typeof value === 'object') {
-        this._walkAzureObject(value, learn, depth + 1);
+        this._walkAzureObject(value, learn, depth + 1, aggressive);
+      }
+    }
+  }
+
+  // Parse `az … -o table` output: header line, dashed separator, then rows
+  // aligned by column. Learn identifier-ish values from each cell.
+  _scanAzTable(text, learn) {
+    const lines = text.split('\n');
+    let headerIdx = -1;
+    for (let i = 0; i < lines.length - 1; i++) {
+      const sep = lines[i + 1];
+      if (/^[\s-]+$/.test(sep) && sep.includes('---') && lines[i].trim()) {
+        headerIdx = i;
+        break;
+      }
+    }
+    if (headerIdx < 0) return;
+
+    // Column spans come from runs of dashes in the separator row.
+    const sep = lines[headerIdx + 1];
+    const cols = [];
+    const re = /-+/g;
+    let m;
+    while ((m = re.exec(sep)) !== null) {
+      cols.push({ start: m.index, end: m.index + m[0].length });
+    }
+    if (cols.length === 0) return;
+
+    const header = lines[headerIdx];
+    const headerNames = cols.map(c =>
+      header.slice(c.start, c.end).trim().toLowerCase());
+
+    for (let i = headerIdx + 2; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      for (let j = 0; j < cols.length; j++) {
+        const { start, end } = cols[j];
+        // Last column runs to EOL to capture wider values.
+        const v = (j === cols.length - 1
+          ? line.slice(start)
+          : line.slice(start, end)).trim();
+        if (!v || _skipValue(v)) continue;
+        if (!_looksLikeIdentifier(v)) continue;
+        learn(v, _categorizeField(headerNames[j] || 'name'));
       }
     }
   }
