@@ -5,6 +5,94 @@ const https = require('https');
 const { Mapper } = require('./mapper');
 const { Detector } = require('./detector');
 
+// --- Structural JSON rewriters ---------------------------------------------
+// The Anthropic API returns extended-thinking blocks with cryptographically
+// signed `signature` fields. Naive string replacement over the raw body can
+// corrupt those signatures and cause API 400 errors on subsequent requests.
+// These helpers only touch user-visible text fields in known structural
+// positions; everything else (signatures, opaque ids, thinking content) is
+// forwarded byte-for-byte.
+
+function anonymizeRequestBody(bodyStr, mapper) {
+  let obj;
+  try { obj = JSON.parse(bodyStr); } catch { return bodyStr; }
+  if (typeof obj.system === 'string') {
+    obj.system = mapper.anonymize(obj.system);
+  } else if (Array.isArray(obj.system)) {
+    for (const block of obj.system) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        block.text = mapper.anonymize(block.text);
+      }
+    }
+  }
+  if (Array.isArray(obj.messages)) {
+    for (const msg of obj.messages) {
+      rewriteMessageContent(msg, (s) => mapper.anonymize(s));
+    }
+  }
+  return JSON.stringify(obj);
+}
+
+function deanonymizeResponseBody(bodyStr, mapper) {
+  let obj;
+  try { obj = JSON.parse(bodyStr); } catch { return bodyStr; }
+  if (Array.isArray(obj.content)) {
+    for (const block of obj.content) {
+      rewriteContentBlock(block, (s) => mapper.deanonymize(s));
+    }
+  }
+  if (obj.error && typeof obj.error.message === 'string') {
+    obj.error.message = mapper.deanonymize(obj.error.message);
+  }
+  return JSON.stringify(obj);
+}
+
+function rewriteMessageContent(msg, rewrite) {
+  if (!msg) return;
+  if (typeof msg.content === 'string') {
+    msg.content = rewrite(msg.content);
+    return;
+  }
+  if (!Array.isArray(msg.content)) return;
+  for (const block of msg.content) {
+    rewriteContentBlock(block, rewrite);
+  }
+}
+
+function rewriteContentBlock(block, rewrite) {
+  if (!block || typeof block !== 'object') return;
+  switch (block.type) {
+    case 'text':
+      if (typeof block.text === 'string') {
+        block.text = rewrite(block.text);
+      }
+      return;
+    case 'tool_use':
+      if (block.input && typeof block.input === 'object') {
+        try {
+          const s = JSON.stringify(block.input);
+          const rewritten = rewrite(s);
+          block.input = JSON.parse(rewritten);
+        } catch { /* leave untouched */ }
+      }
+      return;
+    case 'tool_result':
+      if (typeof block.content === 'string') {
+        block.content = rewrite(block.content);
+      } else if (Array.isArray(block.content)) {
+        for (const sub of block.content) {
+          if (sub?.type === 'text' && typeof sub.text === 'string') {
+            sub.text = rewrite(sub.text);
+          }
+        }
+      }
+      return;
+    default:
+      // thinking, redacted_thinking, and any unknown types: do not touch.
+      return;
+  }
+}
+
 // Transforms an SSE stream, deanonymizing aliases back to real names.
 // Handles aliases that may be split across streaming chunks by buffering
 // text_delta and input_json_delta events per content block.
@@ -38,7 +126,8 @@ class SSETransformer {
     const parts = [];
 
     if (this.eventBuffer) {
-      parts.push(this.mapper.deanonymize(this.eventBuffer));
+      // Forward raw — may contain partial event data including signatures.
+      parts.push(this.eventBuffer);
       this.eventBuffer = '';
     }
 
@@ -80,7 +169,8 @@ class SSETransformer {
 
     let data;
     try { data = JSON.parse(dataLine); } catch {
-      return [this.mapper.deanonymize(raw)];
+      // Unparseable — forward raw, never mutate unknown bytes.
+      return [raw];
     }
 
     if (eventType === 'content_block_start') {
@@ -94,7 +184,8 @@ class SSETransformer {
     }
 
     // All other events (message_start, message_delta, message_stop, ping, etc.)
-    return [this.mapper.deanonymize(raw)];
+    // message_delta carries stop_reason/usage only (no user text); forward raw.
+    return [raw];
   }
 
   _onBlockStart(data, raw) {
@@ -105,7 +196,8 @@ class SSETransformer {
     if (type === 'text') this.textAccumulators[idx] = '';
     if (type === 'tool_use') this.toolInputAccumulators[idx] = '';
 
-    return [this.mapper.deanonymize(raw)];
+    // content_block_start may include a thinking-block signature. Forward raw.
+    return [raw];
   }
 
   _onBlockDelta(data, raw) {
@@ -147,7 +239,9 @@ class SSETransformer {
       return []; // emit on content_block_stop
     }
 
-    return [this.mapper.deanonymize(raw)];
+    // thinking_delta, signature_delta, and any other delta type:
+    // forward raw — never touch signatures or thinking content.
+    return [raw];
   }
 
   _onBlockStop(data, raw) {
@@ -230,8 +324,9 @@ function createProxy(options = {}) {
         }
       }
 
-      // Anonymize the request body (real names -> aliases)
-      const anonBody = mapper.anonymize(body);
+      // Anonymize the request body structurally — only rewrites user-visible
+      // text fields, leaving signatures and thinking blocks intact.
+      const anonBody = anonymizeRequestBody(body, mapper);
 
       if (verbose && body !== anonBody) {
         console.log(`[anon-proxy] \u2192 Anonymized request to ${clientReq.method} ${clientReq.url}`);
@@ -326,7 +421,10 @@ function bufferResponse(mapper, upstreamRes, clientRes, verbose) {
 
   upstreamRes.on('end', () => {
     let body = Buffer.concat(chunks).toString('utf8');
-    const deanon = mapper.deanonymize(body);
+    const ct = upstreamRes.headers['content-type'] || '';
+    const deanon = ct.includes('application/json')
+      ? deanonymizeResponseBody(body, mapper)
+      : body;
 
     const headers = { ...upstreamRes.headers };
     headers['content-length'] = Buffer.byteLength(deanon).toString();
@@ -351,4 +449,9 @@ function bufferResponse(mapper, upstreamRes, clientRes, verbose) {
   });
 }
 
-module.exports = { createProxy, SSETransformer };
+module.exports = {
+  createProxy,
+  SSETransformer,
+  anonymizeRequestBody,
+  deanonymizeResponseBody,
+};

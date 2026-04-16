@@ -14,7 +14,7 @@ function escapeRegExp(s) {
 
 class Mapper {
   constructor(options = {}) {
-    this.caseSensitive = options.caseSensitive ?? false;
+    this.caseSensitive = options.caseSensitive ?? true;
     // Load order: global manual → learned (auto-detected) → local manual (overrides)
     this._files = options.mappingFiles || [
       GLOBAL_MAPPINGS_PATH,
