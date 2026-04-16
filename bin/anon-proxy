@@ -1,0 +1,289 @@
+#!/usr/bin/env node
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { createProxy } = require('../src/proxy');
+const { Mapper, GLOBAL_MAPPINGS_PATH, LEARNED_FILE, LOCAL_MAPPINGS_FILE } = require('../src/mapper');
+const { Detector } = require('../src/detector');
+
+const args = process.argv.slice(2);
+const command = args[0];
+
+function flag(name, fallback) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return fallback;
+  return args[i + 1] ?? true;
+}
+const hasFlag = (name) => args.includes(`--${name}`);
+
+const PID_FILE = path.join(os.homedir(), '.anon-proxy.pid');
+
+switch (command) {
+  // -----------------------------------------------------------------------
+  case 'start': {
+    const port = parseInt(flag('port', '8024'), 10);
+    const verbose = hasFlag('verbose');
+    const daemon = hasFlag('daemon');
+    const upstream = flag('upstream', undefined);
+
+    const mappingFiles = [];
+    const explicit = flag('mappings', null);
+    if (explicit) {
+      mappingFiles.push(path.resolve(explicit));
+    }
+    // Default files are handled by Mapper constructor; only override if explicit
+
+    // Daemon mode: re-spawn ourselves detached
+    if (daemon) {
+      const { spawn } = require('child_process');
+      const childArgs = [__filename, 'start',
+        '--port', String(port),
+        ...(verbose ? ['--verbose'] : []),
+        ...(upstream ? ['--upstream', upstream] : []),
+        ...(explicit ? ['--mappings', explicit] : []),
+      ];
+      const child = spawn(process.execPath, childArgs, {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      fs.writeFileSync(PID_FILE, String(child.pid));
+      console.log(`[anon-proxy] Started in background (PID ${child.pid})`);
+      console.log(`[anon-proxy] export ANTHROPIC_BASE_URL=http://127.0.0.1:${port}`);
+      process.exit(0);
+    }
+
+    const opts = { port, verbose, upstream };
+    if (explicit) opts.mappingFiles = mappingFiles;
+    const { server, mapper } = createProxy(opts);
+
+    server.listen(port, '127.0.0.1', () => {
+      console.log(`[anon-proxy] Listening on http://127.0.0.1:${port}`);
+      console.log(`[anon-proxy] Loaded ${mapper.size} mapping(s)`);
+      console.log(`[anon-proxy] Set: export ANTHROPIC_BASE_URL=http://127.0.0.1:${port}`);
+      if (verbose) console.log('[anon-proxy] Verbose logging enabled');
+    });
+
+    for (const sig of ['SIGINT', 'SIGTERM']) {
+      process.on(sig, () => {
+        console.log(`\n[anon-proxy] Shutting down...`);
+        server.close();
+        try { fs.unlinkSync(PID_FILE); } catch {}
+        process.exit(0);
+      });
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'stop': {
+    try {
+      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8'), 10);
+      process.kill(pid, 'SIGTERM');
+      fs.unlinkSync(PID_FILE);
+      console.log(`[anon-proxy] Stopped (PID ${pid})`);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        console.log('[anon-proxy] No running proxy found (no PID file)');
+      } else if (e.code === 'ESRCH') {
+        fs.unlinkSync(PID_FILE);
+        console.log('[anon-proxy] Process already gone; cleaned up PID file');
+      } else {
+        console.error(`[anon-proxy] Error stopping: ${e.message}`);
+      }
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'status': {
+    const port = parseInt(flag('port', '8024'), 10);
+    fetch(`http://127.0.0.1:${port}/health`)
+      .then((r) => r.json())
+      .then((d) => {
+        let pidInfo = '';
+        try {
+          const pid = fs.readFileSync(PID_FILE, 'utf8').trim();
+          pidInfo = ` (PID ${pid})`;
+        } catch {}
+        console.log(`[anon-proxy] Running${pidInfo} on port ${port}`);
+        console.log(`[anon-proxy] ${d.mappings} mapping(s) loaded`);
+      })
+      .catch(() => {
+        console.log(`[anon-proxy] Not running on port ${port}`);
+      });
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'add': {
+    const real = args[1];
+    const alias = args[2];
+    if (!real || !alias) {
+      console.error('Usage: anon-proxy add <real-name> <alias>  [--global]');
+      process.exit(1);
+    }
+    const target = hasFlag('global')
+      ? GLOBAL_MAPPINGS_PATH
+      : path.resolve(flag('file', LOCAL_MAPPINGS_FILE));
+    Mapper.addMapping(target, real, alias);
+    console.log(`Added: ${real} \u2192 ${alias}`);
+    console.log(`  in ${target}`);
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'remove': {
+    const real = args[1];
+    if (!real) {
+      console.error('Usage: anon-proxy remove <real-name>  [--global]');
+      process.exit(1);
+    }
+    const target = hasFlag('global')
+      ? GLOBAL_MAPPINGS_PATH
+      : path.resolve(flag('file', LOCAL_MAPPINGS_FILE));
+    if (Mapper.removeMapping(target, real)) {
+      console.log(`Removed: ${real}`);
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'list': {
+    const globalMap = Mapper.listMappings(GLOBAL_MAPPINGS_PATH);
+    const localMap = Mapper.listMappings(path.resolve(LOCAL_MAPPINGS_FILE));
+
+    console.log('=== Global mappings ===');
+    console.log(`    ${GLOBAL_MAPPINGS_PATH}`);
+    const gEntries = Object.entries(globalMap);
+    if (gEntries.length === 0) {
+      console.log('    (none)');
+    } else {
+      for (const [r, a] of gEntries) console.log(`    ${r}  \u2192  ${a}`);
+    }
+
+    console.log('\n=== Local mappings ===');
+    console.log(`    ${path.resolve(LOCAL_MAPPINGS_FILE)}`);
+    const lEntries = Object.entries(localMap);
+    if (lEntries.length === 0) {
+      console.log('    (none)');
+    } else {
+      for (const [r, a] of lEntries) console.log(`    ${r}  \u2192  ${a}`);
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'init': {
+    const target = path.resolve(flag('file', LOCAL_MAPPINGS_FILE));
+    if (Mapper.initFile(target)) {
+      console.log(`Created ${target}`);
+      console.log('Edit this file to add your real-name \u2192 alias mappings.');
+    } else {
+      console.log(`${target} already exists`);
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'learned': {
+    const detector = new Detector();
+    const mappings = detector.getMappings();
+    const entries = Object.entries(mappings);
+    if (entries.length === 0) {
+      console.log('No auto-learned mappings yet.');
+      console.log('The proxy learns names from Azure FQDNs, GUIDs, IPs, resource IDs,');
+      console.log('and sensitive JSON fields as requests pass through it.');
+    } else {
+      console.log(`=== Auto-learned mappings (${entries.length}) ===`);
+      console.log(`    ${path.resolve(LEARNED_FILE)}`);
+      for (const [real, alias] of entries) {
+        console.log(`    ${real}  \u2192  ${alias}`);
+      }
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'clear': {
+    const detector = new Detector();
+    const count = detector.size;
+    if (count === 0) {
+      console.log('No learned mappings to clear.');
+    } else {
+      detector.clear();
+      console.log(`Cleared ${count} auto-learned mapping(s).`);
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  case 'test': {
+    const text = args.slice(1).join(' ');
+    if (!text) {
+      console.error('Usage: anon-proxy test <text containing real names>');
+      process.exit(1);
+    }
+    const mapper = new Mapper();
+    const anon = mapper.anonymize(text);
+    console.log(`Original:    ${text}`);
+    console.log(`Anonymized:  ${anon}`);
+    if (anon !== text) {
+      console.log(`Reversed:    ${mapper.deanonymize(anon)}`);
+    } else {
+      console.log('(no replacements — check your mappings file)');
+    }
+    break;
+  }
+
+  // -----------------------------------------------------------------------
+  default:
+    console.log(`anon-proxy — Anonymizing proxy for Claude Code
+
+Prevents real resource names from reaching the Anthropic API.
+Auto-detects Azure FQDNs, GUIDs, IPs, resource IDs, and
+sensitive JSON field values from CLI output. Generates aliases
+automatically. Zero config required, zero dependencies.
+
+COMMANDS
+  start   [opts]                Start the proxy
+  stop                          Stop a daemon proxy
+  status                        Check if the proxy is running
+  learned                       Show auto-detected mappings
+  clear                         Reset auto-detected mappings
+  add     <real> <alias>        Add a manual mapping override
+  remove  <real>                Remove a manual mapping
+  list                          Show manual mappings
+  init                          Create a local manual mappings file
+  test    <text>                Preview anonymization
+
+START OPTIONS
+  --port N          Listen port (default 8024)
+  --verbose         Log every anonymization + newly learned names
+  --daemon          Run in background
+  --upstream URL    API base (default https://api.anthropic.com)
+  --mappings FILE   Use a specific manual mappings file
+
+ADD / REMOVE OPTIONS
+  --global          Target global mappings (~/.config/anon-proxy/mappings.json)
+  --file PATH       Target a specific file
+
+AUTO-DETECTION
+  The proxy auto-detects and anonymizes:
+  - Azure FQDNs     *.database.windows.net, *.vault.azure.net, ...
+  - GUIDs           subscription IDs, tenant IDs, object IDs
+  - IP addresses    all non-loopback IPv4
+  - Resource IDs    /subscriptions/.../resourceGroups/...
+  - JSON fields     name, resourceGroup, serverName, adminUsername, ...
+
+  Learned mappings persist across sessions in .anon-learned.json.
+  Manual overrides in .anon-mappings.json take precedence.
+
+QUICK START
+  1.  anon-proxy start --verbose
+  2.  export ANTHROPIC_BASE_URL=http://127.0.0.1:8024
+  3.  claude                            # names are anonymized automatically
+`);
+}

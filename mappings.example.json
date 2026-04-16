@@ -1,0 +1,14 @@
+{
+  "mappings": {
+    "prod-eastus-sqlsrv-01": "SQL-SERVER-A",
+    "prod-westus-sqlsrv-02": "SQL-SERVER-B",
+    "rg-client-production": "RG-PROD",
+    "rg-client-staging": "RG-STAGING",
+    "sa-clientproddata01": "STORAGE-A",
+    "client-deploy-pipeline": "PIPELINE-A",
+    "client-etl-pipeline": "PIPELINE-B",
+    "acme-corp": "CLIENT-A",
+    "10.0.1.50": "IP-INTERNAL-A",
+    "prod-kv-secrets": "KEYVAULT-A"
+  }
+}

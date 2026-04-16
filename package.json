@@ -1,0 +1,15 @@
+{
+  "name": "anon-proxy",
+  "version": "1.0.0",
+  "description": "Anonymizing proxy for Claude Code — prevents real resource names from reaching the Anthropic API",
+  "bin": {
+    "anon-proxy": "./bin/anon-proxy"
+  },
+  "scripts": {
+    "start": "node bin/anon-proxy start"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

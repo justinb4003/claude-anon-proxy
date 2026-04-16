@@ -1,0 +1,5 @@
+node_modules/
+
+# Local mapping files contain sensitive real names — never commit these
+.anon-mappings.json
+.anon-learned.json
