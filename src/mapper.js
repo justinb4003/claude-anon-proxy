@@ -36,6 +36,12 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Anchored GUID test — used to decide which mappings need a case-insensitive
+// substitution. GUIDs are commonly written in either case in Azure CLI output,
+// code, and docs; we learn them lowercased, so a literal-only match would miss
+// uppercase occurrences and leak them upstream.
+const GUID_TEST_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 class Mapper {
   constructor(options = {}) {
     this.caseSensitive = options.caseSensitive ?? true;
@@ -117,15 +123,27 @@ class Mapper {
     return new Set(this.mappings.keys());
   }
 
+  // Set of all alias strings — passed to the detector so it never re-aliases
+  // one of our own aliases that may have leaked back into outbound text.
+  get knownAliases() {
+    return new Set(this.reverse.keys());
+  }
+
   _compile() {
-    // Longest-match-first prevents partial replacements
+    // Longest-match-first prevents partial replacements.
+    // Force case-insensitive matching for GUID-shaped reals even in case-
+    // sensitive mode — they're stored lowercase but commonly appear uppercase
+    // in CLI output.
     this._anonymizeOps = [...this.mappings.entries()]
       .sort((a, b) => b[0].length - a[0].length)
-      .map(([real, alias]) => ({
-        pattern: this.caseSensitive ? null : new RegExp(escapeRegExp(real), 'gi'),
-        literal: real,
-        replacement: alias,
-      }));
+      .map(([real, alias]) => {
+        const useRegex = !this.caseSensitive || GUID_TEST_RE.test(real);
+        return {
+          pattern: useRegex ? new RegExp(escapeRegExp(real), 'gi') : null,
+          literal: real,
+          replacement: alias,
+        };
+      });
 
     this._deanonymizeOps = [...this.reverse.entries()]
       .sort((a, b) => b[0].length - a[0].length)

@@ -312,7 +312,7 @@ function createProxy(options = {}) {
       let body = Buffer.concat(chunks).toString('utf8');
 
       // Auto-detect new sensitive names and generate aliases
-      const newMappings = detector.scanRequestBody(body, mapper.knownReals);
+      const newMappings = detector.scanRequestBody(body, mapper.knownReals, mapper.knownAliases);
       if (newMappings.length > 0) {
         for (const { real, alias } of newMappings) mapper.addRuntime(real, alias);
         mapper.recompile();

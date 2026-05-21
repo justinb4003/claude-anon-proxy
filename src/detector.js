@@ -149,14 +149,21 @@ class Detector {
    *
    * @param {string} body  Raw JSON request body
    * @param {Set<string>} manualReals  Already-mapped real names (from manual mappings)
+   * @param {Set<string>} knownAliases  Alias strings already in use — never re-alias these
    */
-  scanRequestBody(body, manualReals = new Set()) {
+  scanRequestBody(body, manualReals = new Set(), knownAliases = new Set()) {
     const newMappings = [];
     const justSeen = new Set();
 
     const learn = (real, category) => {
       if (!real || real.length < 2) return;
       if (manualReals.has(real)) return;
+      // If the candidate is already one of our aliases, never re-alias it.
+      // Without this, an alias that leaks into outbound text (e.g. via a file
+      // Claude wrote that the user later cats back) would be treated as a
+      // new "real" and assigned a fresh alias, producing a deanonymization
+      // chain that resolves the alias to the wrong original.
+      if (knownAliases.has(real)) return;
       if (this.learned.has(real)) return;
       if (justSeen.has(real)) return;
       const alias = this._alias(category);
@@ -173,6 +180,7 @@ class Detector {
       // substring replacement will catch it naturally.
       if (manualReals.has(hostname)) return;
       if (manualReals.has(fqdn) || this.learned.has(fqdn) || justSeen.has(fqdn)) return;
+      if (knownAliases.has(fqdn)) return;
       const hostAlias = this.learned.get(hostname)?.alias || hostname;
       const fqdnAlias = `${hostAlias}.${domain}`;
       this.learned.set(fqdn, { alias: fqdnAlias, category: 'fqdn' });
@@ -387,7 +395,12 @@ class Detector {
 
     switch (category) {
       case 'hostname':       return `host-${p(n)}`;
-      case 'guid':           return `00000000-0000-0000-0000-${p(n, 12)}`;
+      // Distinctive non-zero prefix so aliases don't collide with the
+      // ubiquitous `00000000-0000-0000-0000-00000000000N` placeholder pattern
+      // that Claude (and most docs/SDKs) emit in example code. If we used
+      // all-zeros here, any placeholder GUID Claude wrote would get
+      // deanonymized into one of the user's real GUIDs.
+      case 'guid':           return `aaaaaaaa-aaaa-aaaa-aaaa-${p(n, 12)}`;
       case 'ipv4':           return `240.0.${Math.floor((n - 1) / 256)}.${((n - 1) % 256) + 1}`;
       case 'resource_group': return `rg-${p(n)}`;
       case 'resource':       return `res-${p(n)}`;
