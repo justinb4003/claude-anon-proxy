@@ -106,9 +106,54 @@ const SKIP_VALUES = new Set([
   'allow', 'deny', 'default', 'microsoft', 'azure',
 ]);
 
+// Generic words that frequently appear as hostnames, subdomain labels, or
+// resource/field values but carry no client-identifying information. We refuse
+// to learn any value that is *exactly* one of these (case-insensitive). The
+// match is whole-value only, so a real name like "prod-orders-db" is still
+// learned — only a bare "prod" is skipped. Aliasing these was corrupting
+// ordinary text and code: e.g. the word "api" became a host-NNN alias, so
+// "x-api-key" silently round-tripped as a different header name.
+const COMMON_WORDS = new Set([
+  // generic subdomains / endpoints
+  'api', 'www', 'app', 'apps', 'web', 'portal', 'login', 'logout', 'auth',
+  'sso', 'admin', 'dev', 'devel', 'test', 'testing', 'qa', 'uat', 'stage',
+  'staging', 'prod', 'production', 'demo', 'sandbox', 'preview', 'beta',
+  'alpha', 'gateway', 'proxy', 'cdn', 'edge', 'origin', 'mail', 'smtp',
+  'imap', 'ftp', 'sftp', 'ssh', 'vpn', 'dns', 'mx',
+  // generic service / infra words
+  'data', 'config', 'configuration', 'settings', 'server', 'client',
+  'service', 'services', 'host', 'node', 'main', 'master', 'primary',
+  'secondary', 'replica', 'default', 'public', 'private', 'internal',
+  'external', 'status', 'health', 'healthz', 'ready', 'live', 'metrics',
+  'log', 'logs', 'logging', 'debug', 'trace', 'cache', 'queue', 'bus',
+  'broker', 'db', 'database', 'sql', 'nosql', 'redis', 'mongo', 'postgres',
+  'mysql', 'mariadb', 'storage', 'blob', 'file', 'files', 'image', 'images',
+  'media', 'static', 'assets', 'asset', 'content', 'search', 'index',
+  'backup', 'backups', 'archive', 'temp', 'tmp', 'shared', 'common', 'core',
+  'base', 'util', 'utils', 'lib', 'libs', 'bin', 'src', 'build', 'dist',
+  'docs', 'doc', 'readme', 'wiki', 'home',
+  // cloud generic
+  'cluster', 'pool', 'group', 'region', 'zone', 'env', 'environment',
+  'tenant', 'subscription', 'resource', 'resources', 'instance', 'vm',
+  'container', 'registry', 'namespace', 'pod', 'job', 'jobs', 'task',
+  'tasks', 'function', 'functions', 'workflow', 'pipeline', 'pipelines',
+  'trigger', 'event', 'events', 'topic', 'hub', 'stream', 'streams',
+  'workspace', 'project', 'account', 'user', 'users', 'role', 'roles',
+  'policy', 'policies', 'secret', 'secrets', 'key', 'keys', 'token',
+  'tokens', 'cert', 'certs', 'vault', 'network', 'subnet', 'vnet',
+  // protocols / formats
+  'http', 'https', 'tcp', 'udp', 'ssl', 'tls', 'json', 'xml', 'yaml',
+  'csv', 'html',
+]);
+
+function _isCommonWord(s) {
+  return COMMON_WORDS.has(s.toLowerCase());
+}
+
 function _skipValue(val) {
   if (!val || val.length < 2 || val.length > 200) return true;
   if (SKIP_VALUES.has(val.toLowerCase())) return true;
+  if (_isCommonWord(val)) return true;
   if (/^\d+(\.\d+)*$/.test(val)) return true;           // numbers / versions
   if (/^\d{4}-\d{2}-\d{2}/.test(val)) return true;      // dates
   if (/^[A-Z][a-z]+_[A-Z]\w*/.test(val)) return true;   // SKU-like: Standard_B1s
@@ -158,6 +203,9 @@ class Detector {
     const learn = (real, category) => {
       if (!real || real.length < 2) return;
       if (manualReals.has(real)) return;
+      // Never alias a bare generic word (api, prod, server, …) — it carries no
+      // client-identifying info and rewriting it corrupts ordinary text/code.
+      if (_isCommonWord(real)) return;
       // If the candidate is already one of our aliases, never re-alias it.
       // Without this, an alias that leaks into outbound text (e.g. via a file
       // Claude wrote that the user later cats back) would be treated as a
@@ -174,6 +222,9 @@ class Detector {
 
     // Helper for learning FQDNs (hostname + full FQDN together)
     const learnFqdn = (hostname, domain) => {
+      // Generic subdomain labels (api.*, www.*, app.*, login.*) aren't secrets;
+      // skip both the label and the full FQDN so neither gets aliased.
+      if (_isCommonWord(hostname)) return;
       learn(hostname, 'hostname');
       const fqdn = `${hostname}.${domain}`;
       // If the hostname has a manual mapping, skip the FQDN — the mapper's
@@ -489,4 +540,4 @@ function _categorizeField(fieldName) {
   return 'resource';
 }
 
-module.exports = { Detector };
+module.exports = { Detector, COMMON_WORDS, isCommonWord: _isCommonWord };
